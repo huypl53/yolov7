@@ -34,15 +34,13 @@ class Yolov7DetectionModel(DetectionModel):
     def check_dependencies(self) -> None:
         check_requirements(["torch"])
 
-    def load_model(self, image_width, image_height):
+    def load_model(self):
         """
         Detection model is initialized and set to self.model.
         """
 
         # import yolov5
-        assert image_width == image_height
 
-        imgsz = image_width
         try:
             # model = yolov5.load(self.model_path, device=self.device)
             model = attempt_load(self.model_path, map_location=self.device)  # load FP32 model
@@ -52,10 +50,10 @@ class Yolov7DetectionModel(DetectionModel):
             stride = int(model.stride.max())  # model stride
             self.stride = stride
             
-            self.img_size = check_img_size(imgsz, s=stride)  # check img_size
+            self.image_size = check_img_size(self.image_size, s=stride)  # check image_size
             # Run inference
             if self.device != 'cpu':
-                model(torch.zeros(1, 3, self.img_size, self.img_size).to(self.device).type_as(next(model.parameters())))  # run once
+                model(torch.zeros(1, 3, self.image_size, self.image_size).to(self.device).type_as(next(model.parameters())))  # run once
 
         except Exception as e:
             raise TypeError("model_path is not a valid yolov5 model path: ", e)
@@ -71,7 +69,7 @@ class Yolov7DetectionModel(DetectionModel):
         # if model.__class__.__module__ not in ["yolov5.models.common", "models.common"]:
         #     raise Exception(f"Not a yolov5 model: {type(model)}")
 
-        model.conf = self.confidence_threshold
+        # model.conf = self.confidence_threshold
         self.model = model
 
         # set category_mapping
@@ -79,7 +77,7 @@ class Yolov7DetectionModel(DetectionModel):
             category_mapping = {str(ind): category_name for ind, category_name in enumerate(self.category_names)}
             self.category_mapping = category_mapping
 
-    def perform_inference(self, img0: np.ndarray):
+    def perform_inference(self, im0: np.ndarray):
         """
         Prediction is performed using self.model and the prediction result is set to self._original_predictions.
         Args:
@@ -97,7 +95,7 @@ class Yolov7DetectionModel(DetectionModel):
         #     prediction_result = self.model(image)
 
         # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
+        img = letterbox(im0, self.image_size, stride=self.stride)[0]
   
         # Convert
         # img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
@@ -106,8 +104,9 @@ class Yolov7DetectionModel(DetectionModel):
 
         t0 = time.time()
 
-        img = torch.from_numpy(img).to(device)
+        img = torch.from_numpy(img).to(self.device)
         # img = img.half() if half else img.float()  # uint8 to fp16/32
+        img = img.float()
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
@@ -124,11 +123,11 @@ class Yolov7DetectionModel(DetectionModel):
         t1 = time_synchronized()
         with torch.no_grad():   # Calculating gradients would cause a GPU memory leak
             # pred = model(img, augment=opt.augment)[0]
-            pred = model(img)[0]
+            pred = self.model(img)[0]
         t2 = time_synchronized()
 
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        pred = non_max_suppression(pred, self.confidence_threshold, 0.45, classes=list(range(len(self.category_names))), agnostic=False)
         t3 = time_synchronized()
 
         # Apply Classifier
@@ -142,7 +141,6 @@ class Yolov7DetectionModel(DetectionModel):
             # else:
             #     p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
             # p, s, im0, frame = path, '', im0s, 'frame'
-            im0 = im0s
             object_prediction_list = []
 
             # p = Path(p)  # to Path
@@ -150,7 +148,7 @@ class Yolov7DetectionModel(DetectionModel):
             # txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             if len(det):
-                # Rescale boxes from img_size to im0 size
+                # Rescale boxes from image_size to im0 size
                 # det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape)
                 pred[i] = reversed(det)
@@ -231,7 +229,7 @@ class Yolov7DetectionModel(DetectionModel):
 
         # handle all predictions
         object_prediction_list_per_image = []
-        for image_ind, image_predictions_in_xyxy_format in enumerate(original_predictions.xyxy):
+        for image_ind, image_predictions_in_xyxy_format in enumerate(original_predictions):
             shift_amount = shift_amount_list[image_ind]
             full_shape = None if full_shape_list is None else full_shape_list[image_ind]
             object_prediction_list = []
