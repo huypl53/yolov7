@@ -20,7 +20,7 @@ import torch.backends.cudnn as cudnn
 from numpy import random
 
 from models.experimental import attempt_load
-from utils.datasets import LoadStreams, LoadImages
+from utils.datasets import LoadStreams, LoadImages, letterbox
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path
 from utils.plots import plot_one_box
@@ -42,15 +42,20 @@ class Yolov7DetectionModel(DetectionModel):
         # import yolov5
         assert image_width == image_height
 
+        imgsz = image_width
         try:
             # model = yolov5.load(self.model_path, device=self.device)
             model = attempt_load(self.model_path, map_location=self.device)  # load FP32 model
 
             self.set_model(model)
 
+            stride = int(model.stride.max())  # model stride
+            self.stride = stride
+            
+            self.img_size = check_img_size(imgsz, s=stride)  # check img_size
             # Run inference
             if self.device != 'cpu':
-                model(torch.zeros(1, 3, image_width, image_height).to(self.device).type_as(next(model.parameters())))  # run once
+                model(torch.zeros(1, 3, self.img_size, self.img_size).to(self.device).type_as(next(model.parameters())))  # run once
 
         except Exception as e:
             raise TypeError("model_path is not a valid yolov5 model path: ", e)
@@ -74,7 +79,7 @@ class Yolov7DetectionModel(DetectionModel):
             category_mapping = {str(ind): category_name for ind, category_name in enumerate(self.category_names)}
             self.category_mapping = category_mapping
 
-    def perform_inference(self, image: np.ndarray):
+    def perform_inference(self, img0: np.ndarray):
         """
         Prediction is performed using self.model and the prediction result is set to self._original_predictions.
         Args:
@@ -91,90 +96,86 @@ class Yolov7DetectionModel(DetectionModel):
         # else:
         #     prediction_result = self.model(image)
 
-        dataset = LoadImages(source, img_size=imgsz, stride=stride)
+        # Padded resize
+        img = letterbox(img0, self.img_size, stride=self.stride)[0]
+  
+        # Convert
+        # img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = img.transpose(2, 0, 1)
+        img = np.ascontiguousarray(img)
 
         t0 = time.time()
-        for path, img, im0s, vid_cap in dataset:
-            img = torch.from_numpy(img).to(device)
-            img = img.half() if half else img.float()  # uint8 to fp16/32
-            img /= 255.0  # 0 - 255 to 0.0 - 1.0
-            if img.ndimension() == 3:
-                img = img.unsqueeze(0)
 
-            # Warmup
-            # if device.type != 'cpu' and (old_img_b != img.shape[0] or old_img_h != img.shape[2] or old_img_w != img.shape[3]):
-            #     old_img_b = img.shape[0]
-            #     old_img_h = img.shape[2]
-            #     old_img_w = img.shape[3]
-            #     for i in range(3):
-            #         model(img, augment=opt.augment)[0]
+        img = torch.from_numpy(img).to(device)
+        # img = img.half() if half else img.float()  # uint8 to fp16/32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
 
-            # Inference
-            t1 = time_synchronized()
-            with torch.no_grad():   # Calculating gradients would cause a GPU memory leak
-                # pred = model(img, augment=opt.augment)[0]
-                pred = model(img)[0]
-            t2 = time_synchronized()
+        # Warmup
+        # if device.type != 'cpu' and (old_img_b != img.shape[0] or old_img_h != img.shape[2] or old_img_w != img.shape[3]):
+        #     old_img_b = img.shape[0]
+        #     old_img_h = img.shape[2]
+        #     old_img_w = img.shape[3]
+        #     for i in range(3):
+        #         model(img, augment=opt.augment)[0]
 
-            # Apply NMS
-            pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
-            t3 = time_synchronized()
+        # Inference
+        t1 = time_synchronized()
+        with torch.no_grad():   # Calculating gradients would cause a GPU memory leak
+            # pred = model(img, augment=opt.augment)[0]
+            pred = model(img)[0]
+        t2 = time_synchronized()
 
-            # Apply Classifier
-            # if classify:
-            #     pred = apply_classifier(pred, modelc, img, im0s)
+        # Apply NMS
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        t3 = time_synchronized()
 
-            # Process detections
-            for i, det in enumerate(pred):  # detections per image
-                # if webcam:  # batch_size >= 1
-                #     p, s, im0, frame = path[i], '%g: ' % i, im0s[i].copy(), dataset.count
-                # else:
-                #     p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
-                p, s, im0, frame = path, '', im0s, 'frame'
-                object_prediction_list = []
+        # Apply Classifier
+        # if classify:
+        #     pred = apply_classifier(pred, modelc, img, im0s)
 
-                # p = Path(p)  # to Path
-                # save_path = str(save_dir / p.name)  # img.jpg
-                # txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
-                gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-                if len(det):
-                    # Rescale boxes from img_size to im0 size
-                    det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+        # Process detections
+        for i, det in enumerate(pred):  # detections per image
+            # if webcam:  # batch_size >= 1
+            #     p, s, im0, frame = path[i], '%g: ' % i, im0s[i].copy(), dataset.count
+            # else:
+            #     p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
+            # p, s, im0, frame = path, '', im0s, 'frame'
+            im0 = im0s
+            object_prediction_list = []
 
-                    # Print results
-                    # for c in det[:, -1].unique():
-                    #     n = (det[:, -1] == c).sum()  # detections per class
-                        # s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+            # p = Path(p)  # to Path
+            # save_path = str(save_dir / p.name)  # img.jpg
+            # txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
+            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+            if len(det):
+                # Rescale boxes from img_size to im0 size
+                # det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape)
+                pred[i] = reversed(det)
+                # Print results
+                # for c in det[:, -1].unique():
+                #     n = (det[:, -1] == c).sum()  # detections per class
+                    # s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                    # Write results
-                    for *xyxy, conf, cls in reversed(det):
-                        if save_txt:  # Write to file
-                            xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                            line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
-                            with open(txt_path + '.txt', 'a') as f:
-                                f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                # Write results
+                # for *xyxy, conf, cls in reversed(det):
+                #     if save_txt:  # Write to file
+                #         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                #         line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
+                #         with open(txt_path + '.txt', 'a') as f:
+                #             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-                        # if save_img or view_img:  # Add bbox to image
-                        #     label = f'{names[int(cls)]} {conf:.2f}'
-                        #     plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=1)
+                    # if save_img or view_img:  # Add bbox to image
+                    #     label = f'{names[int(cls)]} {conf:.2f}'
+                    #     plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=1)
 
-                # Print time (inference + NMS)
-                # print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+            # Print time (inference + NMS)
+            # print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+        self._original_predictions = pred
 
-
-                        object_prediction = ObjectPrediction(
-                            bbox=bbox,
-                            category_id=category_id,
-                            score=score,
-                            bool_mask=None,
-                            category_name=category_name,
-                            shift_amount=shift_amount,
-                            full_shape=full_shape,
-                        )
-                        object_prediction_list.append(object_prediction)
-                    object_prediction_list_per_image.append(object_prediction_list)
-
-        self._object_prediction_list_per_image = object_prediction_list_per_image
+        
 
     @property
     def num_categories(self):
