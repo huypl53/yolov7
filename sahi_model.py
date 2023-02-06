@@ -28,7 +28,7 @@ from utils.torch_utils import select_device, load_classifier, time_synchronized,
 
 logger = logging.getLogger(__name__)
 
-_category_names = ['bike', 'car']
+_category_names = ['person', 'bike', 'car']
 
 class Yolov7DetectionModel(DetectionModel):
     def check_dependencies(self) -> None:
