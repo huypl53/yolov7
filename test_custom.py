@@ -2,12 +2,17 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 from threading import Thread
+from IPython.core.interactiveshell import default
 
 import numpy as np
 import torch
+from torchvision.utils import save_image
 import yaml
 from tqdm import tqdm
+from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+from sklearn.metrics import classification_report
 
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader
@@ -16,6 +21,13 @@ from utils.general import coco80_to_coco91_class, check_dataset, check_file, che
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
+
+object_maps = {
+    "driver": 0,
+    "learner": 1,
+    "person": 2,
+    "phone": 3
+}
 
 def test(data,
          weights=None,
@@ -39,7 +51,8 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False,):
+         v5_metric=False,
+         save_custom='./save-custom/'):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -101,6 +114,12 @@ def test(data,
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
 
+    pred_using_phone = []
+    gt_using_phone = []
+
+    save_custom_path = Path(save_custom)
+    (save_custom_path / 'phone').mkdir(parents=True, exist_ok=True)
+    (save_custom_path / 'normal').mkdir(parents=True, exist_ok=True)
 
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
@@ -127,23 +146,63 @@ def test(data,
             t1 += time_synchronized() - t
 
         
+        pred = []
         # Statistics per image
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
             path = Path(paths[si])
+            if not ( 'normal' in str(path).lower() ):
+                gt_using_phone.append(True)
+            else:
+                gt_using_phone.append(False)
             seen += 1
 
+            is_using_phone = False
+
+            def _save_image():
+                if is_using_phone:
+                    # print(f'Copy {path} to {save_custom_path}/phone')
+                    shutil.copy2(path, save_custom_path/'phone')
+                else:
+                    # print(f'Copy {path} to {save_custom_path}/normal')
+                    shutil.copy2(path, save_custom_path/'normal')
+
+                pred_using_phone.append(is_using_phone)
             if len(pred) == 0:
                 if nl:
                     stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
 
+                _save_image()
                 continue
 
             # Predictions
             predn = pred.clone()
             scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
+
+            pred_driver_learner = []
+            pred_phone = []
+
+            for *xyxy, conf, cls in predn.tolist():
+                if (cls in (object_maps['driver'], object_maps['learner'])):
+                    pred_driver_learner.append(xyxy)
+                if (cls == object_maps['phone']):
+                    pred_phone.append(xyxy)
+
+            for driver in pred_driver_learner:
+                for phone in pred_phone:
+                    x11, y11, x12, y12 = driver
+                    x21, y21, x22, y22 = phone
+                    xmin = min(x11, x12, x21, x22)
+                    xmax = max(x11, x12, x21, x22)
+                    ymin = min(y11, y12, y21, y22)
+                    ymax = max(y11, y12, y21, y22)
+                    if ( xmax - xmin < ( x12 - x11 ) + (x22 - x21)) and ( ymax - ymin < ( y12 - y11 ) + (y22 - y21)):
+                        is_using_phone = True
+                        break
+            
+            _save_image()
 
 
             # Append to text file
@@ -154,6 +213,13 @@ def test(data,
                     line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
                     with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
                         f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                    if save_custom_path:
+                        if is_using_phone:
+                            with open(save_custom_path / 'phone' / (path.stem + '.txt'), 'a') as f:
+                                f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                        else:
+                            with open(save_custom_path / 'normal' / (path.stem + '.txt'), 'a') as f:
+                                f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
 
             # W&B logging - Media Panel Plots
@@ -233,6 +299,9 @@ def test(data,
     else:
         nt = torch.zeros(1)
 
+    print('Confusion matrix of using phone: \n')
+    print(sk_confusion_matrix(gt_using_phone, pred_using_phone))
+    print('Report of using phone:', classification_report(gt_using_phone, pred_using_phone))
     # Print results
     pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
@@ -314,6 +383,7 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--save-custom', default='./save-custom/',  help='save custom image result')
 
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
@@ -337,6 +407,7 @@ if __name__ == '__main__':
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
              v5_metric=opt.v5_metric,
+             save_custom=opt.save_custom
              )
 
     elif opt.task == 'speed':  # speed benchmarks
