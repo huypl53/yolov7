@@ -16,7 +16,30 @@ from utils.general import coco80_to_coco91_class, check_dataset, check_file, che
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
+from sklearn.metrics import precision_score, accuracy_score, multilabel_confusion_matrix
 
+
+def confusion_matrix2pred_groundtruth(matrix):
+    pr_ind, gt_ind = 0, 0
+
+    max_pre_num = int( np.sum(matrix) )
+    preds = np.zeros(max_pre_num)
+    gts = np.zeros(max_pre_num)
+
+    for pr_cls, row in enumerate( matrix ):
+        for gt_cls, v in enumerate(row):
+            v = int(v)
+            preds[pr_ind: pr_ind+v] = pr_cls
+            pr_ind += v
+
+            gts[gt_ind: gt_ind+v] = gt_cls
+            gt_ind += v
+
+    real_gt_num = max(pr_ind, gt_ind)
+    preds = preds[: real_gt_num]
+    gts = gts[: real_gt_num]
+
+    return preds, gts
 
 def test(data,
          weights=None,
@@ -245,6 +268,26 @@ def test(data,
     # Plots
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
+        matrix = confusion_matrix.matrix
+        preds, gts = confusion_matrix2pred_groundtruth(matrix)
+
+        epsilon = 1e-16
+        mcm = multilabel_confusion_matrix(preds, gts, labels=range(len(matrix)))
+        tn = mcm[:, 0, 0]
+        tp = mcm[:, 1, 1]
+        fn = mcm[:, 1, 0]
+        fp = mcm[:, 0, 1]
+        sensitivity = tp / (tp + fn + epsilon) # len = class num
+        specificity = tn/ ( tn + fp + epsilon) # len = class num
+
+        accuracy = accuracy_score(preds, gts)
+        precision = precision_score(preds, gts, average=None, zero_division=0.0) # return all classes values
+
+        with open(save_dir / 'metrics.csv', 'w') as fw:
+            result = [str( accuracy )] + [','.join( [ str(s) for s in v ] ) for v in (  precision, sensitivity, specificity )  ]
+            result_string = '\n'.join( result )
+            fw.write(result_string)
+
         if wandb_logger and wandb_logger.wandb:
             val_batches = [wandb_logger.wandb.Image(str(f), caption=f.name) for f in sorted(save_dir.glob('test*.jpg'))]
             wandb_logger.log({"Validation": val_batches})
